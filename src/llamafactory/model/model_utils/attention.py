@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from ...extras import logging
 from ...extras.constants import AttentionFunction
+from ...extras.misc import is_torch_supa_available
 from ...extras.packages import is_torch_version_greater_than
 
 
@@ -61,6 +62,14 @@ def configure_attn_implementation(config: "PretrainedConfig", model_args: "Model
         if model_args.flash_attn in (AttentionFunction.AUTO, AttentionFunction.SDPA):
             logger.warning_rank0("Youtu-VL does not support SDPA, forcing eager attention.")
             model_args.flash_attn = AttentionFunction.DISABLED
+
+    if is_torch_supa_available():
+        # supa has no FlashAttention build; SDPA is the fastest supported backend.
+        # AUTO would otherwise be resolved against the cuda-masqueraded device and may pick FA2.
+        if model_args.flash_attn in (AttentionFunction.AUTO, AttentionFunction.FA2, AttentionFunction.FA3):
+            if model_args.flash_attn != AttentionFunction.AUTO:
+                logger.warning_rank0("FlashAttention is unavailable on supa, falling back to SDPA.")
+            model_args.flash_attn = AttentionFunction.SDPA
 
     if model_args.flash_attn == AttentionFunction.AUTO:
         return
