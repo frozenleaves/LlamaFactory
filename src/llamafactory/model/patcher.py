@@ -33,7 +33,6 @@ from .model_utils.longlora import configure_longlora
 from .model_utils.moe import add_z3_leaf_module, configure_moe
 from .model_utils.quantization import configure_quantization
 from .model_utils.rope import configure_rope
-from .model_utils.supa_kernels import patch_rmsnorm_for_supa
 from .model_utils.valuehead import prepare_valuehead_model
 from .model_utils.visual import autocast_projector_dtype, configure_visual_model
 
@@ -484,8 +483,6 @@ def patch_model(
         prepare_model_for_training(model, model_args)
         autocast_projector_dtype(model, model_args)
         add_z3_leaf_module(model)
-        patch_rmsnorm_for_supa(model)
-
         if getattr(model.config, "model_type", None) in [
             "qwen3_5",
             "qwen3_5_moe",
