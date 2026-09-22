@@ -41,13 +41,7 @@ from . import logging
 
 @functools.lru_cache
 def is_torch_supa_available() -> bool:
-    r"""Check if the supa (SUPA PrivateUse1) accelerator is available.
-
-    Transformers has no native probe for supa, so we detect the torch namespace
-    registered by the ``torch_supa`` package. Importing ``torch_supa`` also makes
-    ``torch.cuda.*`` alias ``torch.supa.*`` (see ``transfer_to_supa``), therefore
-    supa must be checked *before* cuda in every device dispatch below.
-    """
+    """Check if the supa (SUPA PrivateUse1) accelerator is available."""
     try:
         import torch_supa  # noqa: F401  # registers the "supa" device
 
