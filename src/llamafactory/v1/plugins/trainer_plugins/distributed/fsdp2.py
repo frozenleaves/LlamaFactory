@@ -1,4 +1,4 @@
-# Copyright 2025 the LlamaFactory team.
+# Copyright 2026 the LlamaFactory team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,13 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import gc
 import os
 
 import torch
+import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 from peft.tuners.lora import LoraLayer
-from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict, set_model_state_dict
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+    get_optimizer_state_dict,
+    set_model_state_dict,
+    set_optimizer_state_dict,
+)
 from torch.distributed.fsdp import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
@@ -34,27 +42,94 @@ from ....utils.types import HFModel, Processor
 logger = get_logger(__name__)
 
 
-def get_transformer_layer_cls(model: HFModel) -> type[nn.Module] | None:
+def _fallback_dot_natural_key(name: str):
+    parts = []
+    for part in name.split("."):
+        if part.isdigit():
+            parts.append((0, int(part)))
+        else:
+            parts.append((1, part))
+    return parts
+
+
+def _get_checkpoint_sort_key():
+    try:
+        from transformers.core_model_loading import dot_natural_key
+
+        return dot_natural_key
+    except ImportError:
+        return _fallback_dot_natural_key
+
+
+def _make_safetensor_loader(checkpoint_file: str, tensor_key: str):
+    # Delay tensor materialization until converter.convert() to reduce peak CPU memory.
+    # This works because HF WeightConverter accepts callables and materializes them later.
+    def _load_tensor():
+        from safetensors import safe_open
+
+        with safe_open(checkpoint_file, framework="pt", device="cpu") as f:
+            return f.get_tensor(tensor_key)
+
+    return _load_tensor
+
+
+def _cast_norm_input_to_weight_dtype(module: nn.Module, args: tuple):
+    """forward-pre-hook: cast a norm layer's input to its weight dtype."""
+    if not args:
+        return None
+    x = args[0]
+    weight = getattr(module, "weight", None)
+    if isinstance(x, torch.Tensor) and weight is not None and x.dtype != weight.dtype:
+        return (x.to(weight.dtype), *args[1:])
+    return None
+
+
+def _make_norms_dtype_safe(model: HFModel) -> int:
+    """Register the dtype-safe hook on every dtype-strict ``nn.LayerNorm`` in the model."""
+    n = 0
+    for module in model.modules():
+        if isinstance(module, nn.LayerNorm):
+            module.register_forward_pre_hook(_cast_norm_input_to_weight_dtype)
+            n += 1
+    return n
+
+
+def is_lora_model(model: HFModel) -> bool:
+    """Return whether PEFT LoRA layers have already been injected into the model."""
+    return any(isinstance(module, LoraLayer) for module in model.modules())
+
+
+def get_transformer_layer_cls(model: HFModel) -> set[type[nn.Module]]:
+    classes: set[type[nn.Module]] = set()
+    for module in model.modules():
+        for attr in ("layers", "blocks"):
+            seq = getattr(module, attr, None)
+            if isinstance(seq, nn.ModuleList) and len(seq) > 0:
+                classes.add(type(seq[0]))
+    if classes:
+        return classes
+
     no_split_modules = getattr(model, "_no_split_modules", None)
     if no_split_modules:
-        if isinstance(no_split_modules, (list, tuple)):
-            for name, module in model.named_modules():
-                for cls_name in no_split_modules:
-                    if module.__class__.__name__ == cls_name:
-                        return module.__class__
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        return type(model.model.layers[0])
-    if hasattr(model, "layers"):
-        return type(model.layers[0])
+        found: dict[str, type[nn.Module]] = {}
+        for _, module in model.named_modules():
+            cls_name = module.__class__.__name__
+            if cls_name in no_split_modules and cls_name not in found:
+                found[cls_name] = module.__class__
+            if len(found) == len(no_split_modules):
+                break
+        if found:
+            return set(found.values())
 
-    return None
+    return set()
 
 
 def save_model(model: HFModel, output_dir: str, processor: Processor) -> None:
     if DistributedInterface().get_rank() == 0:
         logger.info("Gathering state dict for saving...")
 
-    options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+    lora_model = is_lora_model(model)
+    options = StateDictOptions(full_state_dict=True, cpu_offload=True, ignore_frozen_params=lora_model)
     state_dict = get_model_state_dict(model, options=options)
 
     if DistributedInterface().get_rank() == 0:
@@ -64,18 +139,64 @@ def save_model(model: HFModel, output_dir: str, processor: Processor) -> None:
         logger.info(f"Model saved to {output_dir}")
 
 
+def save_checkpoint(model: HFModel, optimizer: torch.optim.Optimizer, ckpt_dir: str, **kwargs) -> None:
+    save_ckpt_as_hf = kwargs.get("save_ckpt_as_hf", False)
+    processor = kwargs.get("processor", None)
+
+    # Always save DCP format for resume capability
+    options = StateDictOptions(full_state_dict=False, cpu_offload=True)
+
+    model_state = get_model_state_dict(model, options=options)
+    dcp.save(state_dict=model_state, checkpoint_id=os.path.join(ckpt_dir, "model"))
+
+    optim_state = get_optimizer_state_dict(model, optimizer, options=options)
+    dcp.save(state_dict=optim_state, checkpoint_id=os.path.join(ckpt_dir, "optimizer"))
+
+    # Additionally save HF format if requested
+    if save_ckpt_as_hf:
+        if DistributedInterface().get_rank() == 0:
+            logger.info("Gathering state dict for saving additional HF format checkpoint...")
+
+        lora_model = is_lora_model(model)
+        hf_options = StateDictOptions(full_state_dict=True, cpu_offload=True, ignore_frozen_params=lora_model)
+        hf_state_dict = get_model_state_dict(model, options=hf_options)
+
+        if DistributedInterface().get_rank() == 0:
+            model_to_save = model.module if hasattr(model, "module") else model
+            hf_dir = os.path.join(ckpt_dir, "hf_model")
+            model_to_save.save_pretrained(hf_dir, state_dict=hf_state_dict, max_shard_size="4GB")
+            if processor is not None:
+                processor.save_pretrained(hf_dir, max_shard_size="4GB")
+
+            logger.info(f"Additional HF format checkpoint saved to {hf_dir}")
+
+
+def load_checkpoint(model: HFModel, optimizer: torch.optim.Optimizer, ckpt_dir: str, **kwargs) -> None:
+    options = StateDictOptions(full_state_dict=False, cpu_offload=True)
+
+    ckpt_model_dir = os.path.join(ckpt_dir, "model")
+    model_state = get_model_state_dict(model, options=options)
+    dcp.load(state_dict=model_state, checkpoint_id=ckpt_model_dir)
+    set_model_state_dict(model, model_state, options=options)
+
+    ckpt_optim_dir = os.path.join(ckpt_dir, "optimizer")
+    optim_state = get_optimizer_state_dict(model, optimizer, options=options)
+    dcp.load(state_dict=optim_state, checkpoint_id=ckpt_optim_dir)
+    set_optimizer_state_dict(model, optimizer, optim_state, options=options)
+
+
 class FSDP2Engine:
-    def __init__(self, dist_config: dict):
+    def __init__(self, dist_config: dict, bf16: bool = False):
         self.dist_interface = DistributedInterface()
         self.rank = self.dist_interface.get_rank()
         self.local_rank = self.dist_interface.get_local_rank()
         self.world_size = self.dist_interface.get_world_size()
-        self.mixed_precision = dist_config.get("mixed_precision", "bf16")
+        self.mixed_precision = "bf16" if bf16 else "fp32"
         self.reshard_after_forward = dist_config.get("reshard_after_forward", True)
         self.offload_params = dist_config.get("offload_params", False)
         self.pin_memory = dist_config.get("pin_memory", True)
         self.dcp_path = dist_config.get("dcp_path", None)
-        self.device_mesh = self.dist_interface.data_device_mesh
+        self.device_mesh = self.dist_interface.model_device_mesh
 
         if self.device_mesh is None:
             logger.warning(
@@ -83,10 +204,7 @@ class FSDP2Engine:
             )
 
         if self.device_mesh is not None:
-            try:
-                self.fsdp_mesh = self.device_mesh["dp"]
-            except Exception:
-                self.fsdp_mesh = self.device_mesh
+            self.fsdp_mesh = self.device_mesh
 
             logger.info(f"Using Device Mesh: {self.fsdp_mesh}")
         else:
@@ -96,10 +214,7 @@ class FSDP2Engine:
         if self.mixed_precision == "bf16":
             param_dtype = torch.bfloat16
             reduce_dtype = torch.float32
-        elif self.mixed_precision == "fp16":
-            param_dtype = torch.float16
-            reduce_dtype = torch.float32
-        else:
+        elif self.mixed_precision == "fp32":
             param_dtype = torch.float32
             reduce_dtype = torch.float32
 
@@ -110,24 +225,28 @@ class FSDP2Engine:
         )
 
     def is_lora_module_wrap(self, model) -> bool:
-        return any(isinstance(module, LoraLayer) for module in model.modules())
+        return is_lora_model(model)
 
-    def prepare_model(self, model: HFModel) -> HFModel:
+    def prepare_model(self, model: HFModel, ignored_params: set[nn.Parameter] | None = None) -> HFModel:
         if self.fsdp_mesh is None:
             logger.warning("No FSDP Mesh available, skipping FSDP wrapping.")
             return model
 
         mp_policy = self.get_mp_policy()
-        layer_cls = get_transformer_layer_cls(model)
+        transformer_layer_cls_to_wrap = get_transformer_layer_cls(model)
 
-        if layer_cls is None:
+        if not transformer_layer_cls_to_wrap:
             logger.warning(
                 "Could not identify Transformer Layer class, applying FSDP to the whole model structure only."
             )
-            transformer_layer_cls_to_wrap = set()
         else:
-            logger.info(f"Applying per-layer FSDP to {layer_cls.__name__}")
-            transformer_layer_cls_to_wrap = {layer_cls}
+            names = ", ".join(cls.__name__ for cls in transformer_layer_cls_to_wrap)
+            logger.info(f"Applying per-layer FSDP to: {names}")
+
+        def _ignored_params_for(module: nn.Module) -> set[nn.Parameter] | None:
+            if not ignored_params:
+                return None
+            return ignored_params.intersection(module.parameters()) or None
 
         if self.is_lora_module_wrap(model):
             lora_modules = []
@@ -144,6 +263,7 @@ class FSDP2Engine:
                     reshard_after_forward=self.reshard_after_forward,
                     mp_policy=mp_policy,
                     offload_policy=CPUOffloadPolicy(pin_memory=self.pin_memory) if self.offload_params else None,
+                    ignored_params=_ignored_params_for(module),
                 )
 
             logger.info("Applying FSDP wrap for LoRA layer separately.")
@@ -164,14 +284,14 @@ class FSDP2Engine:
                     reshard_after_forward=self.reshard_after_forward,
                     mp_policy=mp_policy,
                     offload_policy=CPUOffloadPolicy(pin_memory=self.pin_memory) if self.offload_params else None,
+                    ignored_params=_ignored_params_for(module),
                 )
 
-        use_gradient_checkpointing = True  # Could be configurable
-        if use_gradient_checkpointing:
+        # BaseTrainer is the single source of truth for gradient checkpointing.
+        # FSDP2 only applies the input-grad compatibility hook when checkpointing is already enabled.
+        if getattr(model, "is_gradient_checkpointing", False):
             if self.rank == 0:
-                logger.info("Enabling gradient checkpointing (transformers native)...")
-
-            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                logger.info("Gradient checkpointing is enabled. Applying FSDP2 input grad preparation.")
 
             if hasattr(model, "enable_input_require_grads"):
                 model.enable_input_require_grads()
@@ -182,12 +302,18 @@ class FSDP2Engine:
 
                 model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
+            if self.mixed_precision == "bf16":
+                n_patched = _make_norms_dtype_safe(model)
+                if self.rank == 0 and n_patched:
+                    logger.info(f"Made {n_patched} nn.LayerNorm(s) dtype-safe for bf16 checkpointing.")
+
         fully_shard(
             model,
             mesh=self.fsdp_mesh,
             reshard_after_forward=self.reshard_after_forward,
             mp_policy=mp_policy,
             offload_policy=CPUOffloadPolicy(pin_memory=self.pin_memory) if self.offload_params else None,
+            ignored_params=_ignored_params_for(model),
         )
 
         return model
@@ -213,13 +339,114 @@ class FSDP2Engine:
 
         return model
 
+    def _save_non_persistent_buffers(self, model: HFModel) -> dict:
+        """Save non-persistent buffers, such as inv_freq."""
+        saved = {}
+        for mod_name, module in model.named_modules():
+            for buf_name in module._non_persistent_buffers_set:
+                fqn = f"{mod_name}.{buf_name}" if mod_name else buf_name
+                buf = getattr(module, buf_name, None)
+                if buf is not None:
+                    saved[fqn] = copy.deepcopy(buf)
+        if self.rank == 0 and saved:
+            logger.info(f"Saved {len(saved)} non-persistent buffers")
+        return saved
+
+    def _restore_non_persistent_buffers(self, model: HFModel, saved_buffers: dict):
+        """Register saved non-persistent buffers to model."""
+        if not saved_buffers:
+            return
+        device = get_current_accelerator()
+        for fqn, buf in saved_buffers.items():
+            buf = buf.to(device)
+            if "." in fqn:
+                parent_fqn, buf_name = fqn.rsplit(".", 1)
+                parent_module = model.get_submodule(parent_fqn)
+            else:
+                buf_name = fqn
+                parent_module = model
+            parent_module.register_buffer(buf_name, buf, persistent=False)
+        if self.rank == 0:
+            logger.info(f"Restored {len(saved_buffers)} non-persistent buffers")
+
     def shard_model(self, model: HFModel) -> HFModel:
-        if model.device.type == "meta":
+        init_mode = getattr(model, "_init_mode", "init_on_default")
+
+        if init_mode == "init_on_rank0":
+            non_persistent_buffers = self._save_non_persistent_buffers(model) if self.rank == 0 else {}
+
+            if getattr(model.config, "tie_word_embeddings", False):
+                model.tie_weights()
+
+            if self.rank == 0:
+                logger.info("init_on_rank0 detected: sharding then scattering Rank 0 CPU weights.")
+                full_sd = {k: v.clone() for k, v in model.state_dict().items()}
+            else:
+                full_sd = {}
+
+            model = self.prepare_model(model)
+
+            device = get_current_accelerator()
+            model.to_empty(device=device)
+
+            # Scatter params from Rank 0 into all DTensor shards
+            # Broadcast the full state dict from the global rank-0 process to all ranks in this group.
+            options = StateDictOptions(full_state_dict=True, cpu_offload=True, broadcast_from_rank0=True)
+            set_model_state_dict(model, full_sd, options=options)
+            self._restore_non_persistent_buffers(model, non_persistent_buffers)
+            if self.world_size > 1:
+                for module in model.modules():
+                    for buffer_name in sorted(module._non_persistent_buffers_set):
+                        buffer = getattr(module, buffer_name, None)
+                        if buffer is not None:
+                            torch.distributed.broadcast(buffer, src=0)
+
+            if self.rank == 0:
+                logger.info("init_on_rank0 sync complete.")
+
+        elif init_mode == "init_on_meta":
+            non_persistent_buffers = self._save_non_persistent_buffers(model)
+
+            if getattr(model.config, "tie_word_embeddings", False):
+                model.tie_weights()
+
             model = self.prepare_model(model)
             model = self.materialize_and_load(model, hf_model_path=model.config.name_or_path, dcp_path=self.dcp_path)
+
+            # fix tied broken for no-fsdp-wrap case
+            if getattr(model.config, "tie_word_embeddings", False):
+                model.tie_weights()
+
+            self._restore_non_persistent_buffers(model, non_persistent_buffers)
+
         else:
             model = self.prepare_model(model)
+
+        self._warmup_grad_norm(model)
+
         return model
+
+    def _warmup_grad_norm(self, model: HFModel) -> None:
+        """Warmup grad norm computation to initialize NCCL communication groups."""
+        if self.fsdp_mesh is None:
+            return
+
+        logger.info_rank0("Warming up grad norm computation...")
+
+        for param in model.parameters():
+            if param.requires_grad:
+                param.grad = torch.zeros_like(param)
+
+        with torch.no_grad():
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if isinstance(grad_norm, torch.distributed.tensor.DTensor):
+                grad_norm = grad_norm.full_tensor()
+
+        for param in model.parameters():
+            if param.requires_grad:
+                param.grad = None
+
+        logger.info_rank0("Grad norm warmup completed.")
 
     def _load_from_dcp(self, model: HFModel, dcp_path: str):
         import torch.distributed.checkpoint as dcp
@@ -240,11 +467,37 @@ class FSDP2Engine:
             logger.error(f"Failed to load from DCP: {e}")
             raise e
 
+    def _try_build_hf_weight_conversion_context(self, model: HFModel) -> dict | None:
+        try:
+            from transformers.conversion_mapping import get_model_conversion_mapping
+            from transformers.core_model_loading import WeightConverter, WeightRenaming, rename_source_key
+        except ImportError:
+            return None
+
+        weight_mapping = get_model_conversion_mapping(model)
+        if not weight_mapping:
+            return None
+
+        renamings = [entry for entry in weight_mapping if isinstance(entry, WeightRenaming)]
+        converters = [entry for entry in weight_mapping if isinstance(entry, WeightConverter)]
+        return {
+            "prefix": getattr(model, "base_model_prefix", ""),
+            "meta_state_dict": model.state_dict(),
+            "rename_source_key": rename_source_key,
+            "renamings": renamings,
+            "converters": converters,
+            "converter_templates": {
+                pattern: converter for converter in converters for pattern in converter.source_patterns
+            },
+            "pending_converters": {},
+        }
+
     def _load_weights_from_hf_checkpoint(self, model: HFModel, hf_model_path: str):
         import glob
         import json
 
         hf_model_path = self._resolve_hf_checkpoint_dir(hf_model_path)
+        sort_key = _get_checkpoint_sort_key()
 
         if self.rank == 0:
             logger.info(f"Loading weights from {hf_model_path} ...")
@@ -281,6 +534,7 @@ class FSDP2Engine:
             raise ValueError(f"No checkpoint files found in {hf_model_path}")
 
         param_map = dict(model.named_parameters())
+        conversion_ctx = self._try_build_hf_weight_conversion_context(model)
         total_files = len(checkpoint_files)
 
         for i, ckpt_file in enumerate(checkpoint_files):
@@ -291,16 +545,69 @@ class FSDP2Engine:
                 from safetensors import safe_open
 
                 with safe_open(ckpt_file, framework="pt", device="cpu") as f:
-                    for key in f.keys():
-                        if key in param_map:
+                    for key in sorted(f.keys(), key=sort_key):
+                        renamed_key = key
+                        source_pattern = None
+                        if conversion_ctx is not None:
+                            renamed_key, source_pattern = conversion_ctx["rename_source_key"](
+                                key,
+                                conversion_ctx["renamings"],
+                                conversion_ctx["converters"],
+                                prefix=conversion_ctx["prefix"],
+                                meta_state_dict=conversion_ctx["meta_state_dict"],
+                            )
+
+                        if source_pattern is not None:
+                            template = conversion_ctx["converter_templates"][source_pattern]
+                            converter = conversion_ctx["pending_converters"].setdefault(
+                                renamed_key, copy.deepcopy(template)
+                            )
+                            converter.add_tensor(
+                                renamed_key,
+                                key,
+                                source_pattern,
+                                _make_safetensor_loader(ckpt_file, key),
+                            )
+                        elif renamed_key in param_map:
                             tensor = f.get_tensor(key)
-                            self._copy_weights(param_map[key], tensor)
+                            self._copy_weights(param_map[renamed_key], tensor)
             else:
                 state_dict = torch.load(ckpt_file, map_location="cpu")
-                for key, tensor in state_dict.items():
-                    if key in param_map:
-                        self._copy_weights(param_map[key], tensor)
+                for key, tensor in sorted(state_dict.items(), key=lambda item: sort_key(item[0])):
+                    renamed_key = key
+                    source_pattern = None
+                    if conversion_ctx is not None:
+                        renamed_key, source_pattern = conversion_ctx["rename_source_key"](
+                            key,
+                            conversion_ctx["renamings"],
+                            conversion_ctx["converters"],
+                            prefix=conversion_ctx["prefix"],
+                            meta_state_dict=conversion_ctx["meta_state_dict"],
+                        )
+
+                    if source_pattern is not None:
+                        template = conversion_ctx["converter_templates"][source_pattern]
+                        converter = conversion_ctx["pending_converters"].setdefault(
+                            renamed_key, copy.deepcopy(template)
+                        )
+                        converter.add_tensor(renamed_key, key, source_pattern, tensor)
+                    elif renamed_key in param_map:
+                        self._copy_weights(param_map[renamed_key], tensor)
                 del state_dict
+                gc.collect()
+
+        if conversion_ctx is not None:
+            pending_count = len(conversion_ctx["pending_converters"])
+            log_fn = getattr(logger, "info_rank0", logger.info)
+            log_fn(f"Applying {pending_count} deferred HF weight conversions.")
+            for layer_name, converter in sorted(conversion_ctx["pending_converters"].items()):
+                realized_tensors = converter.convert(layer_name, model=model, config=model.config)
+                for target_name, tensor in realized_tensors.items():
+                    if isinstance(tensor, list):
+                        tensor = tensor[0]
+                    if target_name in param_map:
+                        self._copy_weights(param_map[target_name], tensor)
+                del realized_tensors
                 gc.collect()
 
     def _resolve_hf_checkpoint_dir(self, hf_model_path: str) -> str:

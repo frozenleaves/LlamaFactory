@@ -40,6 +40,26 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
+def _get_gradient_checkpointing_kwargs(model_args: "ModelArguments") -> dict[str, Any]:
+    r"""Build checkpoint kwargs through KT's public activation-context provider."""
+    if not model_args.use_kt:
+        return {"use_reentrant": model_args.use_reentrant_gc}
+
+    policy = model_args.get_kt_activation_policy()
+    if policy["gpu"] != "recompute":
+        return {"use_reentrant": False}
+
+    try:
+        from kt_kernel.sft import get_activation_checkpoint_context_fn
+    except (ImportError, ModuleNotFoundError):
+        logger.warning_rank0_once(
+            "The installed kt-kernel predates the activation checkpoint context API; using non-reentrant checkpointing."
+        )
+        return {"use_reentrant": False}
+
+    return {"use_reentrant": False, "context_fn": get_activation_checkpoint_context_fn()}
+
+
 def get_unsloth_gradient_checkpointing_func() -> Callable:
     class UnslothGradientCheckpointing(torch.autograd.Function):
         r"""Saves VRAM by smartly offloading to RAM."""
@@ -59,13 +79,14 @@ def get_unsloth_gradient_checkpointing_func() -> Callable:
             ctx.save_for_backward(saved_hidden_states)
             ctx.forward_function = forward_function
             ctx.args = args
+            ctx.device = hidden_states.device  # keep the accelerator device (cuda/npu/supa/...)
             return outputs
 
         @staticmethod
         @torch.cuda.amp.custom_bwd
         def backward(ctx: "torch.autograd.Function", grad_output: "torch.Tensor") -> "torch.Tensor":
             (hidden_states,) = ctx.saved_tensors
-            hidden_states = hidden_states.to("cuda", non_blocking=True).detach()
+            hidden_states = hidden_states.to(ctx.device, non_blocking=True).detach()
             hidden_states.requires_grad_(True)
             with torch.enable_grad():
                 outputs = ctx.forward_function(hidden_states, *ctx.args)
@@ -172,7 +193,7 @@ def prepare_model_for_training(model: "PreTrainedModel", model_args: "ModelArgum
             )
             model.gradient_checkpointing_enable = MethodType(gradient_checkpointing_enable, model)
             model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": model_args.use_reentrant_gc}
+                gradient_checkpointing_kwargs=_get_gradient_checkpointing_kwargs(model_args)
             )
             setattr(model.config, "use_cache", False)  # turn off when gradient checkpointing is enabled
             logger.info_rank0("Gradient checkpointing enabled.")

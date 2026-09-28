@@ -65,6 +65,7 @@ def run_sft(
         pad_to_multiple_of=8 if training_args.do_train else None,  # for shift short attention
         label_pad_token_id=IGNORE_INDEX if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id,
         block_diag_attn=model_args.block_diag_attn,
+        neat_packing=data_args.neat_packing,
         attn_implementation=getattr(model.config, "_attn_implementation", None),
         compute_dtype=model_args.compute_dtype,
         **tokenizer_module,
@@ -102,37 +103,18 @@ def run_sft(
     gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
 
     # Initialize our Trainer
-    if model_args.use_kt:
-        from ktransformers.sft.lora import KTrainer  # type: ignore
-        from ktransformers.util.globals import GLOBAL_CONFIG  # type: ignore
-
-        GLOBAL_CONFIG._config["mod"] = "sft"
-
-        trainer = KTrainer(
-            model=model,
-            args=training_args,
-            tokenizer=tokenizer_module,
-            data_collator=data_collator,
-            callbacks=callbacks,
-            **dataset_module,
-            **metric_module,
-        )
-        trainer.model_accepts_loss_kwargs = False
-        model.config.use_cache = False
-
-    else:
-        trainer = CustomSeq2SeqTrainer(
-            model=model,
-            args=training_args,
-            finetuning_args=finetuning_args,
-            data_collator=data_collator,
-            callbacks=callbacks,
-            gen_kwargs=gen_kwargs,
-            ref_model=ref_model,
-            **dataset_module,
-            **tokenizer_module,
-            **metric_module,
-        )
+    trainer = CustomSeq2SeqTrainer(
+        model=model,
+        args=training_args,
+        finetuning_args=finetuning_args,
+        data_collator=data_collator,
+        callbacks=callbacks,
+        gen_kwargs=gen_kwargs,
+        ref_model=ref_model,
+        **dataset_module,
+        **tokenizer_module,
+        **metric_module,
+    )
 
     # Training
     if training_args.do_train:
