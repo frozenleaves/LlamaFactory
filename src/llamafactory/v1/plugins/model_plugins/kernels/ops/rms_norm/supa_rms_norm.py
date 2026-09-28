@@ -28,6 +28,35 @@ from ...base import BaseKernel, KernelPlugin
 logger = get_logger(__name__)
 
 
+# Standard-convention RMSNorm classes: ``y = x * rsqrt(mean(x^2) + eps) * weight``.
+# The fused ``sudnn.rms_norm_func`` matches this convention, so only these classes are patched.
+# Variants with a different weight convention (e.g. Gemma's ``1 + weight``, or gated/residual
+# RMSNorm) are intentionally excluded and fall back to the eager path. Add new class names here
+# after verifying they follow the standard convention.
+_SUPPORTED_RMSNORM_CLASSES = frozenset(
+    {
+        "LlamaRMSNorm",
+        "MistralRMSNorm",
+        "MixtralRMSNorm",
+        "Phi3RMSNorm",
+        "InternLM2RMSNorm",
+        "GlmRMSNorm",
+        "DeepseekV2RMSNorm",
+        "DeepseekV3RMSNorm",
+        "Qwen2RMSNorm",
+        "Qwen2MoeRMSNorm",
+        "Qwen2VLRMSNorm",
+        "Qwen2_5_VLRMSNorm",
+        "Qwen2_5_VLTextRMSNorm",
+        "Qwen3RMSNorm",
+        "Qwen3MoeRMSNorm",
+        "Qwen3VLTextRMSNorm",
+        "Qwen3VLMoeTextRMSNorm",
+    }
+)
+
+
+
 @lru_cache
 def _is_sudnn_rms_norm_available() -> bool:
     """Return whether the fused SUPA RMSNorm operator is registered."""
@@ -106,14 +135,14 @@ class SupaRMSNormKernel(BaseKernel):
 
         patched_count = 0
         patched_classes = set()
+        skipped_classes = set()
         for module in model.modules():
             cls = module.__class__
-            if getattr(module, "_supa_rmsnorm_patched", False) or "RMSNorm" not in cls.__name__:
+            if getattr(module, "_supa_rmsnorm_patched", False):
                 continue
-            if "Gemma" in cls.__name__:
-                logger.warning_rank0_once(
-                    f"Skipping fused SUPA RMSNorm for {cls.__name__} (non-standard weight convention)."
-                )
+            if cls.__name__ not in _SUPPORTED_RMSNORM_CLASSES:
+                if "RMSNorm" in cls.__name__:
+                    skipped_classes.add(cls.__name__)
                 continue
             if not hasattr(module, "weight") or not hasattr(module, "variance_epsilon"):
                 continue
@@ -129,6 +158,12 @@ class SupaRMSNormKernel(BaseKernel):
                 "Applied fused SUPA RMSNorm to {} modules: {}.".format(
                     patched_count, ", ".join(sorted(cls.__name__ for cls in patched_classes))
                 )
+            )
+
+        if skipped_classes:
+            logger.warning_rank0_once(
+                "Skipping fused SUPA RMSNorm for unsupported RMSNorm classes: {}; "
+                "the eager path will be used for them.".format(", ".join(sorted(skipped_classes)))
             )
 
         return model

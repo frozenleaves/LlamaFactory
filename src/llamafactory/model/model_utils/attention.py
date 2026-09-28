@@ -63,16 +63,13 @@ def configure_attn_implementation(config: "PretrainedConfig", model_args: "Model
             logger.warning_rank0("Youtu-VL does not support SDPA, forcing eager attention.")
             model_args.flash_attn = AttentionFunction.DISABLED
 
-    if is_torch_supa_available():
-        # supa has no FlashAttention build; SDPA is the fastest supported backend.
-        # AUTO would otherwise be resolved against the cuda-masqueraded device and may pick FA2.
-        if model_args.flash_attn in (AttentionFunction.AUTO, AttentionFunction.FA2, AttentionFunction.FA3):
-            if model_args.flash_attn != AttentionFunction.AUTO:
-                logger.warning_rank0("FlashAttention is unavailable on supa, falling back to SDPA.")
-            model_args.flash_attn = AttentionFunction.SDPA
-
     if model_args.flash_attn == AttentionFunction.AUTO:
-        return
+        if is_torch_supa_available():
+            # supa has no FlashAttention build, and AUTO would otherwise be resolved against the
+            # cuda-masqueraded device (which may pick FA2); pin SDPA, the fastest supported backend.
+            requested_attn_implementation = "sdpa"
+        else:
+            return
 
     elif model_args.flash_attn == AttentionFunction.DISABLED:
         requested_attn_implementation = "eager"
@@ -86,19 +83,25 @@ def configure_attn_implementation(config: "PretrainedConfig", model_args: "Model
     elif model_args.flash_attn == AttentionFunction.FA2:
         from transformers import is_torch_npu_available
 
-        if not (is_flash_attn_2_available() or is_torch_npu_available()):
+        if is_torch_supa_available():
+            logger.warning_rank0("FlashAttention is unavailable on supa, falling back to SDPA.")
+            requested_attn_implementation = "sdpa"
+        elif not (is_flash_attn_2_available() or is_torch_npu_available()):
             logger.warning_rank0("FlashAttention-2 is not installed.")
             return
-
-        requested_attn_implementation = "flash_attention_2"
+        else:
+            requested_attn_implementation = "flash_attention_2"
     elif model_args.flash_attn == AttentionFunction.FA3:
         from transformers.utils import is_flash_attn_3_available
 
-        if not is_flash_attn_3_available():
+        if is_torch_supa_available():
+            logger.warning_rank0("FlashAttention is unavailable on supa, falling back to SDPA.")
+            requested_attn_implementation = "sdpa"
+        elif not is_flash_attn_3_available():
             logger.warning_rank0("FlashAttention-3 is not installed.")
             return
-
-        requested_attn_implementation = "flash_attention_3"
+        else:
+            requested_attn_implementation = "flash_attention_3"
     else:
         raise NotImplementedError(f"Unknown attention type: {model_args.flash_attn}")
 
