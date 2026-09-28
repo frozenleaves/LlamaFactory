@@ -224,8 +224,9 @@ def load_model(
         model.eval()
     else:
         model.train()
-
-    # Borrow the v1 kernel plugin registry for v0 while the kernel configuration is being transitioned.
+    
+    # Borrowing the kernel plugins ability of v1 to temporarily apply the NPU fusion operator to v0,
+    # it is turned off by default, and can be discarded after the transition period ends.
     if model_args.use_v1_kernels and is_trainable:
         logger.warning_rank0(
             "You are try to using future feature about kernels, please note that this feature "
