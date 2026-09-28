@@ -394,7 +394,7 @@ class TorchProfilerCallback(TrainerCallback):
 
         activities = [torch.profiler.ProfilerActivity.CPU]
         try:
-            if is_torch_cuda_available() and not is_torch_supa_available():
+            if is_torch_cuda_available():
                 activities.append(torch.profiler.ProfilerActivity.CUDA)
             if is_torch_npu_available():
                 activities.append(torch.profiler.ProfilerActivity.NPU)

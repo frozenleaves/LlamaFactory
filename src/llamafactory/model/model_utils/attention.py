@@ -63,16 +63,13 @@ def configure_attn_implementation(config: "PretrainedConfig", model_args: "Model
             logger.warning_rank0("Youtu-VL does not support SDPA, forcing eager attention.")
             model_args.flash_attn = AttentionFunction.DISABLED
 
-    if is_torch_supa_available():
-        # supa has no FlashAttention build; SDPA is the fastest supported backend.
-        # AUTO would otherwise be resolved against the cuda-masqueraded device and may pick FA2.
-        if model_args.flash_attn in (AttentionFunction.AUTO, AttentionFunction.FA2, AttentionFunction.FA3):
-            if model_args.flash_attn != AttentionFunction.AUTO:
-                logger.warning_rank0("FlashAttention is unavailable on supa, falling back to SDPA.")
-            model_args.flash_attn = AttentionFunction.SDPA
-
     if model_args.flash_attn == AttentionFunction.AUTO:
-        return
+        if is_torch_supa_available():
+            # supa has no FlashAttention build, and AUTO would otherwise be resolved against the
+            # cuda-masqueraded device (which may pick FA2); pin SDPA, the fastest supported backend.
+            requested_attn_implementation = "sdpa"
+        else:
+            return
 
     elif model_args.flash_attn == AttentionFunction.DISABLED:
         requested_attn_implementation = "eager"
