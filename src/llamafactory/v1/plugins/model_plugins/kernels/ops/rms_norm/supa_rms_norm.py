@@ -135,16 +135,11 @@ class SupaRMSNormKernel(BaseKernel):
 
         patched_count = 0
         patched_classes = set()
-        skipped_classes = set()
         for module in model.modules():
             cls = module.__class__
             if getattr(module, "_supa_rmsnorm_patched", False):
                 continue
             if cls.__name__ not in _SUPPORTED_RMSNORM_CLASSES:
-                if "RMSNorm" in cls.__name__:
-                    skipped_classes.add(cls.__name__)
-                continue
-            if not hasattr(module, "weight") or not hasattr(module, "variance_epsilon"):
                 continue
 
             module._supa_rmsnorm_original_forward = module.forward
@@ -158,12 +153,6 @@ class SupaRMSNormKernel(BaseKernel):
                 "Applied fused SUPA RMSNorm to {} modules: {}.".format(
                     patched_count, ", ".join(sorted(cls.__name__ for cls in patched_classes))
                 )
-            )
-
-        if skipped_classes:
-            logger.warning_rank0_once(
-                "Skipping fused SUPA RMSNorm for unsupported RMSNorm classes: {}; "
-                "the eager path will be used for them.".format(", ".join(sorted(skipped_classes)))
             )
 
         return model
