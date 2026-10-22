@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from ...extras import logging
 from ...extras.constants import AttentionFunction
+from ...extras.misc import is_torch_supa_available
 from ...extras.packages import is_torch_version_greater_than
 
 
@@ -63,7 +64,12 @@ def configure_attn_implementation(config: "PretrainedConfig", model_args: "Model
             model_args.flash_attn = AttentionFunction.DISABLED
 
     if model_args.flash_attn == AttentionFunction.AUTO:
-        return
+        if is_torch_supa_available():
+            # supa has no FlashAttention build, and AUTO would otherwise be resolved against the
+            # cuda-masqueraded device (which may pick FA2); pin SDPA, the fastest supported backend.
+            requested_attn_implementation = "sdpa"
+        else:
+            return
 
     elif model_args.flash_attn == AttentionFunction.DISABLED:
         requested_attn_implementation = "eager"
@@ -82,11 +88,23 @@ def configure_attn_implementation(config: "PretrainedConfig", model_args: "Model
             return
 
         requested_attn_implementation = "flash_attention_2"
+    elif model_args.flash_attn == AttentionFunction.FA3:
+        from transformers.utils import is_flash_attn_3_available
+
+        if not is_flash_attn_3_available():
+            logger.warning_rank0("FlashAttention-3 is not installed.")
+            return
+
+        requested_attn_implementation = "flash_attention_3"
     else:
         raise NotImplementedError(f"Unknown attention type: {model_args.flash_attn}")
 
     if getattr(config, "model_type", None) == "internlm2":  # special case for custom models
         setattr(config, "attn_implementation", requested_attn_implementation)
+    elif getattr(config, "model_type", None) == "kimi_k25":
+        setattr(config, "_attn_implementation", requested_attn_implementation)
+        setattr(config.vision_config, "_attn_implementation", requested_attn_implementation)
+        setattr(config.text_config, "_attn_implementation", requested_attn_implementation)
     elif getattr(config, "model_type", None) == "kimi_vl":
         setattr(config.vision_config, "_attn_implementation", requested_attn_implementation)
         setattr(config.text_config, "_attn_implementation", requested_attn_implementation)
@@ -109,6 +127,8 @@ def print_attn_implementation(config: "PretrainedConfig") -> None:
 
     if attn_implementation == "flash_attention_2":
         logger.info_rank0("Using FlashAttention-2 for faster training and inference.")
+    elif attn_implementation == "flash_attention_3":
+        logger.info_rank0("Using FlashAttention-3 for faster training and inference.")
     elif attn_implementation == "sdpa":
         logger.info_rank0("Using torch SDPA for faster training and inference.")
     else:

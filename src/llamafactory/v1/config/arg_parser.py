@@ -21,6 +21,7 @@ from omegaconf import OmegaConf
 from transformers import HfArgumentParser
 
 from ..utils.env import is_env_enabled
+from ..utils.helper import set_seed
 from .data_args import DataArguments
 from .model_args import ModelArguments
 from .sample_args import SampleArguments
@@ -56,7 +57,12 @@ def get_args(args: InputArgument = None) -> tuple[ModelArguments, DataArguments,
             print(f"Got unknown args, potentially deprecated arguments: {unknown_args}")
             raise ValueError(f"Some specified arguments are not used by the HfArgumentParser: {unknown_args}")
 
-    return tuple(parsed_args)
+    model_args, data_args, training_args, sample_args = parsed_args
+    # Seed as early as possible after argument parsing so all downstream
+    # components (dist init, dataloader, model init in run_* entrypoints) share the same RNG state.
+    set_seed(training_args.seed, full_determinism=training_args.full_determinism)
+
+    return model_args, data_args, training_args, sample_args
 
 
 if __name__ == "__main__":
